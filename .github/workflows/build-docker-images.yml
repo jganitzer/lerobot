@@ -49,7 +49,7 @@ jobs:
           context: .
           file: ./docker/lerobot-cpu/Dockerfile
           push: true
-          tags: huggingface/lerobot-cpu
+          tags: jganitzer/lerobot-cpu
           build-args: PYTHON_VERSION=${{ env.PYTHON_VERSION }}
 
 
@@ -89,7 +89,7 @@ jobs:
           context: .
           file: ./docker/lerobot-gpu/Dockerfile
           push: true
-          tags: huggingface/lerobot-gpu
+          tags: jganitzer/lerobot-gpu
           build-args: PYTHON_VERSION=${{ env.PYTHON_VERSION }}
 
 
@@ -127,5 +127,5 @@ jobs:
           context: .
           file: ./docker/lerobot-gpu-dev/Dockerfile
           push: true
-          tags: huggingface/lerobot-gpu:dev
+          tags: jganitzer/lerobot-gpu:dev
           build-args: PYTHON_VERSION=${{ env.PYTHON_VERSION }}
