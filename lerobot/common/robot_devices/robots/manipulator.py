@@ -364,6 +364,7 @@ class ManipulatorRobot:
         for name in self.follower_arms:
             print(f"Connecting {name} follower arm.")
             self.follower_arms[name].connect()
+        for name in self.leader_arms:
             print(f"Connecting {name} leader arm.")
             self.leader_arms[name].connect()
 
@@ -495,6 +496,17 @@ class ManipulatorRobot:
         for name in self.follower_arms:
             # Set a velocity limit of 131 as advised by Trossen Robotics
             self.follower_arms[name].write("Velocity_Limit", 131)
+
+            # Use 'extended position mode' for all motors except gripper, because in joint mode the servos can't
+            # rotate more than 360 degrees (from 0 to 4095) And some mistake can happen while assembling the arm,
+            # you could end up with a servo with a position 0 or 4095 at a crucial point See [
+            # https://emanual.robotis.com/docs/en/dxl/x/x_series/#operating-mode11]
+            all_motors_except_gripper = [
+                name for name in self.follower_arms[name].motor_names if name != "gripper"
+            ]
+            if len(all_motors_except_gripper) > 0:
+                # 4 corresponds to Extended Position on Aloha motors
+                self.follower_arms[name].write("Operating_Mode", 4, all_motors_except_gripper)
 
             # Use 'position control current based' for follower gripper to be limited by the limit of the current.
             # It can grasp an object without forcing too much even tho,
@@ -669,6 +681,10 @@ class ManipulatorRobot:
             self.follower_arms[name].write("Goal_Position", goal_pos)
 
         return torch.cat(action_sent)
+
+    def print_logs(self):
+        pass
+        # TODO(aliberts): move robot-specific logs logic here
 
     def disconnect(self):
         if not self.is_connected:

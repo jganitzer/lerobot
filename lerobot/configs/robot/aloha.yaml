@@ -1,3 +1,11 @@
+# Aloha: A Low-Cost Hardware for Bimanual Teleoperation
+# https://aloha-2.github.io
+# https://www.trossenrobotics.com/aloha-stationary
+
+# Requires installing extras packages
+# With pip: `pip install -e ".[dynamixel intelrealsense]"`
+# With poetry: `poetry install --sync --extras "dynamixel intelrealsense"`
+
 _target_: lerobot.common.robot_devices.robots.manipulator.ManipulatorRobot
 robot_type: aloha
 # Specific to Aloha, LeRobot comes with default calibration files. Assuming the motors have been
@@ -82,26 +90,26 @@ follower_arms:
 # on another USB hub or PCIe card.
 cameras:
   cam_high:
-    _target_: lerobot.common.robot_devices.cameras.opencv.OpenCVCamera
-    camera_index: 10
+    _target_: lerobot.common.robot_devices.cameras.intelrealsense.IntelRealSenseCamera
+    serial_number: 128422271347
     fps: 30
     width: 640
     height: 480
   cam_low:
-    _target_: lerobot.common.robot_devices.cameras.opencv.OpenCVCamera
-    camera_index: 22
+    _target_: lerobot.common.robot_devices.cameras.intelrealsense.IntelRealSenseCamera
+    serial_number: 130322270656
     fps: 30
     width: 640
     height: 480
   cam_left_wrist:
-    _target_: lerobot.common.robot_devices.cameras.opencv.OpenCVCamera
-    camera_index: 16
+    _target_: lerobot.common.robot_devices.cameras.intelrealsense.IntelRealSenseCamera
+    serial_number: 218622272670
     fps: 30
     width: 640
     height: 480
   cam_right_wrist:
-    _target_: lerobot.common.robot_devices.cameras.opencv.OpenCVCamera
-    camera_index: 4
+    _target_: lerobot.common.robot_devices.cameras.intelrealsense.IntelRealSenseCamera
+    serial_number: 130322272300
     fps: 30
     width: 640
     height: 480
