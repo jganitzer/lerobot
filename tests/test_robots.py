@@ -28,9 +28,9 @@ from pathlib import Path
 import pytest
 import torch
 
-from lerobot.common.robot_devices.robots.manipulator import ManipulatorRobot
+from lerobot.common.robot_devices.robots.utils import make_robot
 from lerobot.common.robot_devices.utils import RobotDeviceAlreadyConnectedError, RobotDeviceNotConnectedError
-from tests.utils import TEST_ROBOT_TYPES, make_robot, require_robot
+from tests.utils import TEST_ROBOT_TYPES, mock_calibration_dir, require_robot
 
 
 @pytest.mark.parametrize("robot_type, mock", TEST_ROBOT_TYPES)
@@ -39,13 +39,12 @@ def test_robot(tmpdir, request, robot_type, mock):
     # TODO(rcadene): measure fps in nightly?
     # TODO(rcadene): test logs
     # TODO(rcadene): add compatibility with other robots
-
-    robot_kwargs = {"robot_type": robot_type}
+    robot_kwargs = {"robot_type": robot_type, "mock": mock}
 
     if robot_type == "aloha" and mock:
         # To simplify unit test, we do not rerun manual calibration for Aloha mock=True.
         # Instead, we use the files from '.cache/calibration/aloha_default'
-        overrides_calibration_dir = None
+        pass
     else:
         if mock:
             request.getfixturevalue("patch_builtins_input")
@@ -53,17 +52,11 @@ def test_robot(tmpdir, request, robot_type, mock):
         # Create an empty calibration directory to trigger manual calibration
         tmpdir = Path(tmpdir)
         calibration_dir = tmpdir / robot_type
-        overrides_calibration_dir = [f"calibration_dir={calibration_dir}"]
+        mock_calibration_dir(calibration_dir)
         robot_kwargs["calibration_dir"] = calibration_dir
 
-    # Test connecting without devices raises an error
-    robot = ManipulatorRobot(**robot_kwargs)
-    with pytest.raises(ValueError):
-        robot.connect()
-    del robot
-
     # Test using robot before connecting raises an error
-    robot = ManipulatorRobot(**robot_kwargs)
+    robot = make_robot(**robot_kwargs)
     with pytest.raises(RobotDeviceNotConnectedError):
         robot.teleop_step()
     with pytest.raises(RobotDeviceNotConnectedError):
@@ -79,7 +72,7 @@ def test_robot(tmpdir, request, robot_type, mock):
     del robot
 
     # Test connecting (triggers manual calibration)
-    robot = make_robot(robot_type, overrides=overrides_calibration_dir, mock=mock)
+    robot = make_robot(**robot_kwargs)
     robot.connect()
     assert robot.is_connected
 
@@ -92,9 +85,7 @@ def test_robot(tmpdir, request, robot_type, mock):
     robot.disconnect()
 
     # Test teleop can run
-    robot = make_robot(robot_type, overrides=overrides_calibration_dir, mock=mock)
-    if overrides_calibration_dir is not None:
-        robot.calibration_dir = calibration_dir
+    robot = make_robot(**robot_kwargs)
     robot.connect()
     robot.teleop_step()
 
@@ -127,6 +118,7 @@ def test_robot(tmpdir, request, robot_type, mock):
             # TODO(rcadene): skipping image for now as it's challenging to assess equality between two consecutive frames
             continue
         assert torch.allclose(captured_observation[name], observation[name], atol=1)
+        assert captured_observation[name].shape == observation[name].shape
 
     # Test send_action can run
     robot.send_action(action["action"])

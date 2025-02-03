@@ -1,146 +1,23 @@
+"""Contains logic to instantiate a robot, read information from its motors and cameras,
+and send orders to its motors.
+"""
+# TODO(rcadene, aliberts): reorganize the codebase into one file per robot, with the associated
+# calibration procedure, to make it easy for people to add their own robot.
+
 import json
 import logging
 import time
 import warnings
-from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import torch
 
-from lerobot.common.robot_devices.cameras.utils import Camera
-from lerobot.common.robot_devices.motors.dynamixel import (
-    CalibrationMode,
-    TorqueMode,
-    convert_degrees_to_steps,
-)
-from lerobot.common.robot_devices.motors.utils import MotorsBus
+from lerobot.common.robot_devices.cameras.utils import make_cameras_from_configs
+from lerobot.common.robot_devices.motors.utils import MotorsBus, make_motors_buses_from_configs
+from lerobot.common.robot_devices.robots.configs import ManipulatorRobotConfig
 from lerobot.common.robot_devices.robots.utils import get_arm_id
 from lerobot.common.robot_devices.utils import RobotDeviceAlreadyConnectedError, RobotDeviceNotConnectedError
-
-########################################################################
-# Calibration logic
-########################################################################
-
-URL_TEMPLATE = (
-    "https://raw.githubusercontent.com/huggingface/lerobot/main/media/{robot}/{arm}_{position}.webp"
-)
-
-# The following positions are provided in nominal degree range ]-180, +180[
-# For more info on these constants, see comments in the code where they get used.
-ZERO_POSITION_DEGREE = 0
-ROTATED_POSITION_DEGREE = 90
-
-
-def assert_drive_mode(drive_mode):
-    # `drive_mode` is in [0,1] with 0 means original rotation direction for the motor, and 1 means inverted.
-    if not np.all(np.isin(drive_mode, [0, 1])):
-        raise ValueError(f"`drive_mode` contains values other than 0 or 1: ({drive_mode})")
-
-
-def apply_drive_mode(position, drive_mode):
-    assert_drive_mode(drive_mode)
-    # Convert `drive_mode` from [0, 1] with 0 indicates original rotation direction and 1 inverted,
-    # to [-1, 1] with 1 indicates original rotation direction and -1 inverted.
-    signed_drive_mode = -(drive_mode * 2 - 1)
-    position *= signed_drive_mode
-    return position
-
-
-def compute_nearest_rounded_position(position, models):
-    delta_turn = convert_degrees_to_steps(ROTATED_POSITION_DEGREE, models)
-    nearest_pos = np.round(position.astype(float) / delta_turn) * delta_turn
-    return nearest_pos.astype(position.dtype)
-
-
-def run_arm_calibration(arm: MotorsBus, robot_type: str, arm_name: str, arm_type: str):
-    """This function ensures that a neural network trained on data collected on a given robot
-    can work on another robot. For instance before calibration, setting a same goal position
-    for each motor of two different robots will get two very different positions. But after calibration,
-    the two robots will move to the same position.To this end, this function computes the homing offset
-    and the drive mode for each motor of a given robot.
-
-    Homing offset is used to shift the motor position to a ]-2048, +2048[ nominal range (when the motor uses 2048 steps
-    to complete a half a turn). This range is set around an arbitrary "zero position" corresponding to all motor positions
-    being 0. During the calibration process, you will need to manually move the robot to this "zero position".
-
-    Drive mode is used to invert the rotation direction of the motor. This is useful when some motors have been assembled
-    in the opposite orientation for some robots. During the calibration process, you will need to manually move the robot
-    to the "rotated position".
-
-    After calibration, the homing offsets and drive modes are stored in a cache.
-
-    Example of usage:
-    ```python
-    run_arm_calibration(arm, "koch", "left", "follower")
-    ```
-    """
-    if (arm.read("Torque_Enable") != TorqueMode.DISABLED.value).any():
-        raise ValueError("To run calibration, the torque must be disabled on all motors.")
-
-    print(f"\nRunning calibration of {robot_type} {arm_name} {arm_type}...")
-
-    print("\nMove arm to zero position")
-    print("See: " + URL_TEMPLATE.format(robot=robot_type, arm=arm_type, position="zero"))
-    input("Press Enter to continue...")
-
-    # We arbitrarily chose our zero target position to be a straight horizontal position with gripper upwards and closed.
-    # It is easy to identify and all motors are in a "quarter turn" position. Once calibration is done, this position will
-    # correspond to every motor angle being 0. If you set all 0 as Goal Position, the arm will move in this position.
-    zero_target_pos = convert_degrees_to_steps(ZERO_POSITION_DEGREE, arm.motor_models)
-
-    # Compute homing offset so that `present_position + homing_offset ~= target_position`.
-    zero_pos = arm.read("Present_Position")
-    zero_nearest_pos = compute_nearest_rounded_position(zero_pos, arm.motor_models)
-    homing_offset = zero_target_pos - zero_nearest_pos
-
-    # The rotated target position corresponds to a rotation of a quarter turn from the zero position.
-    # This allows to identify the rotation direction of each motor.
-    # For instance, if the motor rotates 90 degree, and its value is -90 after applying the homing offset, then we know its rotation direction
-    # is inverted. However, for the calibration being successful, we need everyone to follow the same target position.
-    # Sometimes, there is only one possible rotation direction. For instance, if the gripper is closed, there is only one direction which
-    # corresponds to opening the gripper. When the rotation direction is ambiguous, we arbitrarely rotate clockwise from the point of view
-    # of the previous motor in the kinetic chain.
-    print("\nMove arm to rotated target position")
-    print("See: " + URL_TEMPLATE.format(robot=robot_type, arm=arm_type, position="rotated"))
-    input("Press Enter to continue...")
-
-    rotated_target_pos = convert_degrees_to_steps(ROTATED_POSITION_DEGREE, arm.motor_models)
-
-    # Find drive mode by rotating each motor by a quarter of a turn.
-    # Drive mode indicates if the motor rotation direction should be inverted (=1) or not (=0).
-    rotated_pos = arm.read("Present_Position")
-    drive_mode = (rotated_pos < zero_pos).astype(np.int32)
-
-    # Re-compute homing offset to take into account drive mode
-    rotated_drived_pos = apply_drive_mode(rotated_pos, drive_mode)
-    rotated_nearest_pos = compute_nearest_rounded_position(rotated_drived_pos, arm.motor_models)
-    homing_offset = rotated_target_pos - rotated_nearest_pos
-
-    print("\nMove arm to rest position")
-    print("See: " + URL_TEMPLATE.format(robot=robot_type, arm=arm_type, position="rest"))
-    input("Press Enter to continue...")
-    print()
-
-    # Joints with rotational motions are expressed in degrees in nominal range of [-180, 180]
-    calib_mode = [CalibrationMode.DEGREE.name] * len(arm.motor_names)
-
-    # TODO(rcadene): make type of joints (DEGREE or LINEAR) configurable from yaml?
-    if robot_type == "aloha" and "gripper" in arm.motor_names:
-        # Joints with linear motions (like gripper of Aloha) are experessed in nominal range of [0, 100]
-        calib_idx = arm.motor_names.index("gripper")
-        calib_mode[calib_idx] = CalibrationMode.LINEAR.name
-
-    calib_data = {
-        "homing_offset": homing_offset.tolist(),
-        "drive_mode": drive_mode.tolist(),
-        "start_pos": zero_pos.tolist(),
-        "end_pos": rotated_pos.tolist(),
-        "calib_mode": calib_mode,
-        "motor_names": arm.motor_names,
-    }
-    return calib_data
 
 
 def ensure_safe_goal_position(
@@ -163,51 +40,6 @@ def ensure_safe_goal_position(
     return safe_goal_pos
 
 
-########################################################################
-# Manipulator robot
-########################################################################
-
-
-@dataclass
-class ManipulatorRobotConfig:
-    """
-    Example of usage:
-    ```python
-    ManipulatorRobotConfig()
-    ```
-    """
-
-    # Define all components of the robot
-    robot_type: str | None = None
-    leader_arms: dict[str, MotorsBus] = field(default_factory=lambda: {})
-    follower_arms: dict[str, MotorsBus] = field(default_factory=lambda: {})
-    cameras: dict[str, Camera] = field(default_factory=lambda: {})
-
-    # Optionally limit the magnitude of the relative positional target vector for safety purposes.
-    # Set this to a positive scalar to have the same value for all motors, or a list that is the same length
-    # as the number of motors in your follower arms (assumes all follower arms have the same number of
-    # motors).
-    max_relative_target: list[float] | float | None = None
-
-    # Optionally set the leader arm in torque mode with the gripper motor set to this angle. This makes it
-    # possible to squeeze the gripper and have it spring back to an open position on its own. If None, the
-    # gripper is not put in torque mode.
-    gripper_open_degree: float | None = None
-
-    def __setattr__(self, prop: str, val):
-        if prop == "max_relative_target" and val is not None and isinstance(val, Sequence):
-            for name in self.follower_arms:
-                if len(self.follower_arms[name].motors) != len(val):
-                    raise ValueError(
-                        f"len(max_relative_target)={len(val)} but the follower arm with name {name} has "
-                        f"{len(self.follower_arms[name].motors)} motors. Please make sure that the "
-                        f"`max_relative_target` list has as many parameters as there are motors per arm. "
-                        "Note: This feature does not yet work with robots where different follower arms have "
-                        "different numbers of motors."
-                    )
-        super().__setattr__(prop, val)
-
-
 class ManipulatorRobot:
     # TODO(rcadene): Implement force feedback
     """This class allows to control any manipulator robot of various number of motors.
@@ -218,11 +50,16 @@ class ManipulatorRobot:
     - [Koch v1.1](https://github.com/jess-moss/koch-v1-1) developed by Jess Moss
     - [Aloha](https://www.trossenrobotics.com/aloha-kits) developed by Trossen Robotics
 
-    Example of highest frequency teleoperation without camera:
+    Example of instantiation, a pre-defined robot config is required:
+    ```python
+    robot = ManipulatorRobot(KochRobotConfig())
+    ```
+
+    Example of overwritting motors during instantiation:
     ```python
     # Defines how to communicate with the motors of the leader and follower arms
     leader_arms = {
-        "main": DynamixelMotorsBus(
+        "main": DynamixelMotorsBusConfig(
             port="/dev/tty.usbmodem575E0031751",
             motors={
                 # name: (index, model)
@@ -236,7 +73,7 @@ class ManipulatorRobot:
         ),
     }
     follower_arms = {
-        "main": DynamixelMotorsBus(
+        "main": DynamixelMotorsBusConfig(
             port="/dev/tty.usbmodem575E0032081",
             motors={
                 # name: (index, model)
@@ -249,35 +86,11 @@ class ManipulatorRobot:
             },
         ),
     }
-    robot = ManipulatorRobot(
-        robot_type="koch",
-        calibration_dir=".cache/calibration/koch",
-        leader_arms=leader_arms,
-        follower_arms=follower_arms,
-    )
-
-    # Connect motors buses and cameras if any (Required)
-    robot.connect()
-
-    while True:
-        robot.teleop_step()
+    robot_config = KochRobotConfig(leader_arms=leader_arms, follower_arms=follower_arms)
+    robot = ManipulatorRobot(robot_config)
     ```
 
-    Example of highest frequency data collection without camera:
-    ```python
-    # Assumes leader and follower arms have been instantiated already (see first example)
-    robot = ManipulatorRobot(
-        robot_type="koch",
-        calibration_dir=".cache/calibration/koch",
-        leader_arms=leader_arms,
-        follower_arms=follower_arms,
-    )
-    robot.connect()
-    while True:
-        observation, action = robot.teleop_step(record_data=True)
-    ```
-
-    Example of highest frequency data collection with cameras:
+    Example of overwritting cameras during instantiation:
     ```python
     # Defines how to communicate with 2 cameras connected to the computer.
     # Here, the webcam of the laptop and the phone (connected in USB to the laptop)
@@ -287,31 +100,28 @@ class ManipulatorRobot:
         "laptop": OpenCVCamera(camera_index=0, fps=30, width=640, height=480),
         "phone": OpenCVCamera(camera_index=1, fps=30, width=640, height=480),
     }
+    robot = ManipulatorRobot(KochRobotConfig(cameras=cameras))
+    ```
 
-    # Assumes leader and follower arms have been instantiated already (see first example)
-    robot = ManipulatorRobot(
-        robot_type="koch",
-        calibration_dir=".cache/calibration/koch",
-        leader_arms=leader_arms,
-        follower_arms=follower_arms,
-        cameras=cameras,
-    )
+    Once the robot is instantiated, connect motors buses and cameras if any (Required):
+    ```python
     robot.connect()
+    ```
+
+    Example of highest frequency teleoperation, which doesn't require cameras:
+    ```python
+    while True:
+        robot.teleop_step()
+    ```
+
+    Example of highest frequency data collection from motors and cameras (if any):
+    ```python
     while True:
         observation, action = robot.teleop_step(record_data=True)
     ```
 
-    Example of controlling the robot with a policy (without running multiple policies in parallel to ensure highest frequency):
+    Example of controlling the robot with a policy:
     ```python
-    # Assumes leader and follower arms + cameras have been instantiated already (see previous example)
-    robot = ManipulatorRobot(
-        robot_type="koch",
-        calibration_dir=".cache/calibration/koch",
-        leader_arms=leader_arms,
-        follower_arms=follower_arms,
-        cameras=cameras,
-    )
-    robot.connect()
     while True:
         # Uses the follower arms and cameras to capture an observation
         observation = robot.capture_observation()
@@ -332,22 +142,71 @@ class ManipulatorRobot:
 
     def __init__(
         self,
-        config: ManipulatorRobotConfig | None = None,
-        calibration_dir: Path = ".cache/calibration/koch",
-        **kwargs,
+        config: ManipulatorRobotConfig,
     ):
-        if config is None:
-            config = ManipulatorRobotConfig()
-        # Overwrite config arguments using kwargs
-        self.config = replace(config, **kwargs)
-        self.calibration_dir = Path(calibration_dir)
-
-        self.robot_type = self.config.robot_type
-        self.leader_arms = self.config.leader_arms
-        self.follower_arms = self.config.follower_arms
-        self.cameras = self.config.cameras
+        self.config = config
+        self.robot_type = self.config.type
+        self.calibration_dir = Path(self.config.calibration_dir)
+        self.leader_arms = make_motors_buses_from_configs(self.config.leader_arms)
+        self.follower_arms = make_motors_buses_from_configs(self.config.follower_arms)
+        self.cameras = make_cameras_from_configs(self.config.cameras)
         self.is_connected = False
         self.logs = {}
+
+    def get_motor_names(self, arm: dict[str, MotorsBus]) -> list:
+        return [f"{arm}_{motor}" for arm, bus in arm.items() for motor in bus.motors]
+
+    @property
+    def camera_features(self) -> dict:
+        cam_ft = {}
+        for cam_key, cam in self.cameras.items():
+            key = f"observation.images.{cam_key}"
+            cam_ft[key] = {
+                "shape": (cam.height, cam.width, cam.channels),
+                "names": ["height", "width", "channels"],
+                "info": None,
+            }
+        return cam_ft
+
+    @property
+    def motor_features(self) -> dict:
+        action_names = self.get_motor_names(self.leader_arms)
+        state_names = self.get_motor_names(self.leader_arms)
+        return {
+            "action": {
+                "dtype": "float32",
+                "shape": (len(action_names),),
+                "names": action_names,
+            },
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (len(state_names),),
+                "names": state_names,
+            },
+        }
+
+    @property
+    def features(self):
+        return {**self.motor_features, **self.camera_features}
+
+    @property
+    def has_camera(self):
+        return len(self.cameras) > 0
+
+    @property
+    def num_cameras(self):
+        return len(self.cameras)
+
+    @property
+    def available_arms(self):
+        available_arms = []
+        for name in self.follower_arms:
+            arm_id = get_arm_id(name, "follower")
+            available_arms.append(arm_id)
+        for name in self.leader_arms:
+            arm_id = get_arm_id(name, "leader")
+            available_arms.append(arm_id)
+        return available_arms
 
     def connect(self):
         if self.is_connected:
@@ -368,6 +227,11 @@ class ManipulatorRobot:
             print(f"Connecting {name} leader arm.")
             self.leader_arms[name].connect()
 
+        if self.robot_type in ["koch", "koch_bimanual", "aloha"]:
+            from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
+        elif self.robot_type in ["so100", "moss"]:
+            from lerobot.common.robot_devices.motors.feetech import TorqueMode
+
         # We assume that at connection time, arms are in a rest position, and torque can
         # be safely disabled to run calibration and/or set robot preset configurations.
         for name in self.follower_arms:
@@ -378,12 +242,12 @@ class ManipulatorRobot:
         self.activate_calibration()
 
         # Set robot preset (e.g. torque in leader gripper for Koch v1.1)
-        if self.robot_type == "koch":
+        if self.robot_type in ["koch", "koch_bimanual"]:
             self.set_koch_robot_preset()
         elif self.robot_type == "aloha":
             self.set_aloha_robot_preset()
-        else:
-            warnings.warn(f"No preset found for robot type: {self.robot_type}", stacklevel=1)
+        elif self.robot_type in ["so100", "moss"]:
+            self.set_so100_robot_preset()
 
         # Enable torque on all motors of the follower arms
         for name in self.follower_arms:
@@ -391,11 +255,21 @@ class ManipulatorRobot:
             self.follower_arms[name].write("Torque_Enable", 1)
 
         if self.config.gripper_open_degree is not None:
+            if self.robot_type not in ["koch", "koch_bimanual"]:
+                raise NotImplementedError(
+                    f"{self.robot_type} does not support position AND current control in the handle, which is require to set the gripper open."
+                )
             # Set the leader arm in torque mode with the gripper motor set to an angle. This makes it possible
             # to squeeze the gripper and have it spring back to an open position on its own.
             for name in self.leader_arms:
                 self.leader_arms[name].write("Torque_Enable", 1, "gripper")
                 self.leader_arms[name].write("Goal_Position", self.config.gripper_open_degree, "gripper")
+
+        # Check both arms can be read
+        for name in self.follower_arms:
+            self.follower_arms[name].read("Present_Position")
+        for name in self.leader_arms:
+            self.leader_arms[name].read("Present_Position")
 
         # Connect the cameras
         for name in self.cameras:
@@ -417,8 +291,20 @@ class ManipulatorRobot:
                 with open(arm_calib_path) as f:
                     calibration = json.load(f)
             else:
+                # TODO(rcadene): display a warning in __init__ if calibration file not available
                 print(f"Missing calibration file '{arm_calib_path}'")
-                calibration = run_arm_calibration(arm, self.robot_type, name, arm_type)
+
+                if self.robot_type in ["koch", "koch_bimanual", "aloha"]:
+                    from lerobot.common.robot_devices.robots.dynamixel_calibration import run_arm_calibration
+
+                    calibration = run_arm_calibration(arm, self.robot_type, name, arm_type)
+
+                elif self.robot_type in ["so100", "moss"]:
+                    from lerobot.common.robot_devices.robots.feetech_calibration import (
+                        run_arm_manual_calibration,
+                    )
+
+                    calibration = run_arm_manual_calibration(arm, self.robot_type, name, arm_type)
 
                 print(f"Calibration is done! Saving calibration file '{arm_calib_path}'")
                 arm_calib_path.parent.mkdir(parents=True, exist_ok=True)
@@ -436,6 +322,8 @@ class ManipulatorRobot:
 
     def set_koch_robot_preset(self):
         def set_operating_mode_(arm):
+            from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
+
             if (arm.read("Torque_Enable") != TorqueMode.DISABLED.value).any():
                 raise ValueError("To run set robot preset, the torque must be disabled on all motors.")
 
@@ -522,6 +410,23 @@ class ManipulatorRobot:
                 f"`gripper_open_degree` is set to {self.config.gripper_open_degree}, but None is expected for Aloha instead",
                 stacklevel=1,
             )
+
+    def set_so100_robot_preset(self):
+        for name in self.follower_arms:
+            # Mode=0 for Position Control
+            self.follower_arms[name].write("Mode", 0)
+            # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
+            self.follower_arms[name].write("P_Coefficient", 16)
+            # Set I_Coefficient and D_Coefficient to default value 0 and 32
+            self.follower_arms[name].write("I_Coefficient", 0)
+            self.follower_arms[name].write("D_Coefficient", 32)
+            # Close the write lock so that Maximum_Acceleration gets written to EPROM address,
+            # which is mandatory for Maximum_Acceleration to take effect after rebooting.
+            self.follower_arms[name].write("Lock", 0)
+            # Set Maximum_Acceleration to 254 to speedup acceleration and deceleration of
+            # the motors. Note: this configuration is not in the official STS3215 Memory Table
+            self.follower_arms[name].write("Maximum_Acceleration", 254)
+            self.follower_arms[name].write("Acceleration", 254)
 
     def teleop_step(
         self, record_data=False
